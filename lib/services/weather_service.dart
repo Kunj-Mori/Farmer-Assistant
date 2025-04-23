@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:geocoding/geocoding.dart';
 
 class WeatherService {
-  final String apiKey = dotenv.env['OPENWEATHER_API_KEY'] ?? '';
-  final String baseUrl = 'https://api.openweathermap.org/data/2.5';
+  final String _apiKey = dotenv.env['OPENWEATHER_API_KEY'] ?? '';
+  final String _baseUrl = 'https://api.openweathermap.org/data/2.5';
+  final String _geoUrl = 'https://api.openweathermap.org/geo/1.0';
   static const String citiesKey = 'recent_cities';
   static const int maxRecentCities = 5;
 
@@ -30,40 +32,47 @@ class WeatherService {
   ];
 
   Future<List<String>> getRecentCities() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getStringList(citiesKey) ?? [];
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getStringList('recent_cities') ?? [];
+    } catch (e) {
+      print('Error getting recent cities: $e');
+      return [];
+    }
   }
 
   Future<void> addRecentCity(String cityName) async {
-    final prefs = await SharedPreferences.getInstance();
-    final recentCities = await getRecentCities();
-    
-    if (!recentCities.contains(cityName)) {
-      recentCities.insert(0, cityName);
-      if (recentCities.length > maxRecentCities) {
-        recentCities.removeLast();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final recentCities = await getRecentCities();
+      
+      if (!recentCities.contains(cityName)) {
+        recentCities.insert(0, cityName);
+        if (recentCities.length > 5) {
+          recentCities.removeLast();
+        }
+        await prefs.setStringList('recent_cities', recentCities);
       }
-      await prefs.setStringList(citiesKey, recentCities);
+    } catch (e) {
+      print('Error adding recent city: $e');
     }
   }
 
   Future<List<Map<String, String>>> searchCities(String query) async {
-    if (query.isEmpty) return [];
+    if (query.length < 3) return [];
 
     try {
       final response = await http.get(
-        Uri.parse(
-          'https://api.openweathermap.org/geo/1.0/direct?q=$query&limit=5&appid=$apiKey'
-        ),
+        Uri.parse('$_geoUrl/direct?q=$query&limit=5&appid=$_apiKey'),
       );
 
       if (response.statusCode == 200) {
         final List<dynamic> data = json.decode(response.body);
-        return data.map<Map<String, String>>((city) {
+        return data.map((city) {
           return {
-            'name': city['name'],
-            'country': city['country'],
-            'state': city['state'] ?? '',
+            'name': city['name'] as String,
+            'state': city['state'] as String? ?? '',
+            'country': city['country'] as String,
           };
         }).toList();
       }
@@ -95,83 +104,159 @@ class WeatherService {
     return await Geolocator.getCurrentPosition();
   }
 
-  Future<Map<String, dynamic>> getCurrentWeather(
-      {double? latitude, double? longitude}) async {
+  Future<String> getCityFromCoordinates(Position position) async {
     try {
-      Position? position;
-      if (latitude == null || longitude == null) {
-        position = await getCurrentLocation();
-        latitude = position.latitude;
-        longitude = position.longitude;
+      List<Placemark> placemarks = await placemarkFromCoordinates(
+        position.latitude,
+        position.longitude,
+      );
+      if (placemarks.isNotEmpty) {
+        return placemarks.first.locality ?? 'Unknown';
       }
-
-      final response = await http.get(Uri.parse(
-          '$baseUrl/weather?lat=$latitude&lon=$longitude&appid=$apiKey&units=metric'));
-
-      if (response.statusCode == 200) {
-        return json.decode(response.body);
-      } else {
-        throw Exception('Failed to load weather data');
-      }
+      return 'Unknown';
     } catch (e) {
-      print('Error getting weather data: $e');
-      rethrow;
+      print('Error getting city name: $e');
+      return 'Unknown';
     }
   }
 
-  Future<Map<String, dynamic>> getWeatherForecast(
-      {double? latitude, double? longitude}) async {
+  Future<Map<String, dynamic>> getWeatherByLocation(Position position) async {
     try {
-      Position? position;
-      if (latitude == null || longitude == null) {
-        position = await getCurrentLocation();
-        latitude = position.latitude;
-        longitude = position.longitude;
-      }
-
-      final response = await http.get(Uri.parse(
-          '$baseUrl/forecast?lat=$latitude&lon=$longitude&appid=$apiKey&units=metric'));
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/weather?lat=${position.latitude}&lon=${position.longitude}&appid=$_apiKey&units=metric',
+        ),
+      );
 
       if (response.statusCode == 200) {
-        return json.decode(response.body);
-      } else {
-        throw Exception('Failed to load forecast data');
+        final data = json.decode(response.body);
+        return {
+          'temperature': data['main']['temp'],
+          'description': data['weather'][0]['description'],
+          'humidity': data['main']['humidity'],
+          'windSpeed': data['wind']['speed'],
+          'cityName': data['name'],
+        };
       }
+      throw Exception('Failed to load weather data');
     } catch (e) {
-      print('Error getting forecast data: $e');
+      print('Error getting weather by location: $e');
       rethrow;
     }
   }
 
   Future<Map<String, dynamic>> getWeatherByCity(String cityName) async {
     try {
-      final response = await http.get(Uri.parse(
-          '$baseUrl/weather?q=$cityName&appid=$apiKey&units=metric'));
+      // First get city coordinates
+      final geoResponse = await http.get(
+        Uri.parse('$_geoUrl/direct?q=$cityName&limit=1&appid=$_apiKey'),
+      );
 
-      if (response.statusCode == 200) {
-        await addRecentCity(cityName);
-        return json.decode(response.body);
-      } else {
-        throw Exception('Failed to load weather data for $cityName');
+      if (geoResponse.statusCode == 200) {
+        final List<dynamic> locations = json.decode(geoResponse.body);
+        if (locations.isEmpty) throw Exception('City not found');
+
+        final location = locations.first;
+        final lat = location['lat'];
+        final lon = location['lon'];
+
+        // Then get weather data
+        final weatherResponse = await http.get(
+          Uri.parse(
+            '$_baseUrl/weather?lat=$lat&lon=$lon&appid=$_apiKey&units=metric',
+          ),
+        );
+
+        if (weatherResponse.statusCode == 200) {
+          final data = json.decode(weatherResponse.body);
+          return {
+            'temperature': data['main']['temp'],
+            'description': data['weather'][0]['description'],
+            'humidity': data['main']['humidity'],
+            'windSpeed': data['wind']['speed'],
+            'cityName': data['name'],
+          };
+        }
       }
+      throw Exception('Failed to load weather data');
     } catch (e) {
-      print('Error getting weather data: $e');
+      print('Error getting weather by city: $e');
       rethrow;
     }
   }
 
-  Future<Map<String, dynamic>> getForecastByCity(String cityName) async {
+  Future<List<Map<String, dynamic>>> getWeatherForecast(String cityName) async {
     try {
-      final response = await http.get(Uri.parse(
-          '$baseUrl/forecast?q=$cityName&appid=$apiKey&units=metric'));
+      // First get city coordinates
+      final geoResponse = await http.get(
+        Uri.parse('$_geoUrl/direct?q=$cityName&limit=1&appid=$_apiKey'),
+      );
 
-      if (response.statusCode == 200) {
-        return json.decode(response.body);
-      } else {
-        throw Exception('Failed to load forecast data for $cityName');
+      if (geoResponse.statusCode == 200) {
+        final List<dynamic> locations = json.decode(geoResponse.body);
+        if (locations.isEmpty) throw Exception('City not found');
+
+        final location = locations.first;
+        final lat = location['lat'];
+        final lon = location['lon'];
+
+        // Then get forecast data
+        final forecastResponse = await http.get(
+          Uri.parse(
+            '$_baseUrl/forecast?lat=$lat&lon=$lon&appid=$_apiKey&units=metric',
+          ),
+        );
+
+        if (forecastResponse.statusCode == 200) {
+          final data = json.decode(forecastResponse.body);
+          final List<dynamic> list = data['list'];
+
+          // Group forecasts by day
+          final Map<String, Map<String, dynamic>> dailyForecasts = {};
+
+          for (var item in list) {
+            final dateTime = DateTime.fromMillisecondsSinceEpoch(item['dt'] * 1000);
+            final date = DateTime(dateTime.year, dateTime.month, dateTime.day);
+            final dateString = date.toIso8601String().split('T')[0];
+
+            if (!dailyForecasts.containsKey(dateString)) {
+              dailyForecasts[dateString] = {
+                'dateTime': date,
+                'temperature': item['main']['temp'],
+                'minTemp': item['main']['temp_min'],
+                'maxTemp': item['main']['temp_max'],
+                'description': item['weather'][0]['description'],
+                'humidity': item['main']['humidity'],
+                'windSpeed': item['wind']['speed'],
+                'hourlyForecasts': [],
+              };
+            }
+
+            // Add hourly forecast data
+            (dailyForecasts[dateString]!['hourlyForecasts'] as List).add({
+              'time': dateTime,
+              'temperature': item['main']['temp'],
+              'description': item['weather'][0]['description'],
+              'humidity': item['main']['humidity'],
+              'windSpeed': item['wind']['speed'],
+            });
+
+            // Update min/max temperatures
+            final currentTemp = item['main']['temp'] as double;
+            if (currentTemp < dailyForecasts[dateString]!['minTemp']) {
+              dailyForecasts[dateString]!['minTemp'] = currentTemp;
+            }
+            if (currentTemp > dailyForecasts[dateString]!['maxTemp']) {
+              dailyForecasts[dateString]!['maxTemp'] = currentTemp;
+            }
+          }
+
+          return dailyForecasts.values.take(7).toList();
+        }
       }
+      throw Exception('Failed to load forecast data');
     } catch (e) {
-      print('Error getting forecast data: $e');
+      print('Error getting forecast: $e');
       rethrow;
     }
   }
